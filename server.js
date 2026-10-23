@@ -80,28 +80,37 @@ function send(res, code, obj) {
 // ==================== EMBED ====================
 function buildEmbed(p, routeKey) {
   const isDel = !!p.deleted;
-  const sea   = SEA[Number(p.placeId)] || 'Unknown';
-  const ts    = Number(p.timestamp) || Math.floor(Date.now() / 1000);
+  let seaName = SEA[Number(p.placeId)] || 'Unknown';
+  seaName = seaName.replace('Sea', 'World'); // Đổi Sea thành World
+
+  const ts = Number(p.timestamp) || Math.floor(Date.now() / 1000);
+  const timeString = new Date(ts * 1000).toISOString().replace('T', ' ').slice(0, 19);
+
+  // Xử lý tên: Nếu là Full Moon 5/5 thì đổi thành Full Moon
+  let displayName = p.name ?? '?';
+  if (displayName === 'Full Moon 5/5') {
+    displayName = 'Full Moon';
+  }
 
   const fields = [
-    { name: '🌊 Sea',     value: sea,                       inline: true  },
-    { name: '👥 Players', value: String(p.players ?? '?'),  inline: true  },
-    { name: '🏷️ PlaceId', value: String(p.placeId ?? '?'),  inline: true  },
-    { name: '🔐 JobId',   value: '`' + String(p.jobId ?? '—') + '`', inline: false }, // Lấy trực tiếp từ p.jobId (đã encode)
+    { name: 'Player Count', value: `\`${p.players ?? '?'}\``, inline: false },
+    { name: 'World',        value: `\`${seaName}\``,           inline: false },
+    { name: 'Name',         value: `\`${displayName}\``,       inline: false }, // Đã dùng displayName
+    { name: 'Job Id PC Copy', value: `\`\`\`\nVEXZHUB|${p.jobId ?? '—'}\n\`\`\``, inline: false },
+    { name: 'Job Id Mobile Copy', value: `\`\`\`\nVEXZHUB|${p.jobId ?? '—'}\n\`\`\``, inline: false },
+    { name: 'Time',         value: timeString,                 inline: false }
   ];
 
-  if (p.hint   != null) fields.push({ name: 'Hint',   value: String(p.hint),   inline: false });
-  if (p.island != null) fields.push({ name: 'Island', value: String(p.island), inline: false });
+  if (p.hint   != null) fields.push({ name: 'Hint',   value: `\`${p.hint}\``,   inline: false });
+  if (p.island != null) fields.push({ name: 'Island', value: `\`${p.island}\``, inline: false });
 
-  const isFullMoon = p.name === 'Full Moon 5/5';
-  const prefix     = isDel ? '❌ Mất' : (isFullMoon ? '🌕 FULL MOON' : '✅ Có');
+  let titleText = 'VexzHub Webhook';
+  if (isDel) titleText = `❌ VexzHub Webhook (Mất)`;
 
   return {
-    title:     `${prefix}: ${p.name}`,
-    color:     isDel ? 0x7f8c8d : (COLORS[p.type] ?? 0x5865f2),
-    fields,
-    timestamp: new Date(ts * 1000).toISOString(),
-    footer:    { text: `VexzHub · ${sea} · ${p.type}` },
+    title: titleText,
+    color: 0xFFFFFF, // Viền trắng full
+    fields: fields,
   };
 }
 
@@ -183,7 +192,6 @@ const server = http.createServer(async (req, res) => {
     if (!safeEqual(expected, authToken)) return send(res, 401, { ok: false, error: 'bad token' });
 
     // ---------- 2. ENCODE JOBID NGAY TẠI ĐÂY ----------
-    // Biến đổi jobId gốc thành dạng Base64URL trước khi lưu vào Web hoặc gửi Discord
     if (p.jobId) {
       p.jobId = Buffer.from(String(p.jobId)).toString('base64url');
     }
@@ -199,7 +207,6 @@ const server = http.createServer(async (req, res) => {
     DEDUP_CACHE.set(dedupKey, now);
 
     // ---------- 4. LƯU LOG NGUYÊN BẢN VÀO RAM ----------
-    // Lúc này p.jobId đã là chuỗi encode, nên trên Web sẽ hiện encode
     IN_MEMORY_LOGS.unshift(p);
     if (IN_MEMORY_LOGS.length > 100) IN_MEMORY_LOGS.pop();
 
