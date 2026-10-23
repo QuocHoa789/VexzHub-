@@ -9,11 +9,9 @@ const PORT       = parseInt(process.env.PORT || '3000', 10);
 const HOST       = '0.0.0.0';
 const ROUTE      = process.env.ROUTE || '/api';
 const MAX_SKEW   = 300;
-const SPAM_TIMEOUT = 60 * 1000; // Chống spam: 60 giây (60,000 ms)
+const SPAM_TIMEOUT = 60 * 1000; // Chống spam: 60 giây
 
-// Mảng lưu log trên RAM (giới hạn 100 cái gần nhất)
 const IN_MEMORY_LOGS = [];
-// Bộ nhớ đệm chống trùng lặp (Key -> Timestamp)
 const DEDUP_CACHE = new Map();
 
 if (!SECRET_KEY) {
@@ -40,24 +38,14 @@ const WEBHOOKS = {
 const FALLBACK = process.env.WEBHOOK_FALLBACK;
 
 const SEA = {
-  2753915549:      'Sea 1',
-  85211729168715:  'Sea 1',
-  4442272183:      'Sea 2',
-  79091703265657:  'Sea 2',
-  7449423635:      'Sea 3',
-  100117331123089: 'Sea 3',
+  2753915549:      'Sea 1', 85211729168715:  'Sea 1',
+  4442272183:      'Sea 2', 79091703265657:  'Sea 2',
+  7449423635:      'Sea 3', 100117331123089: 'Sea 3',
 };
 
 const COLORS = {
-  SecretHint: 0x9b59b6,
-  Boss:       0xe74c3c,
-  Item:       0xf1c40f,
-  Island:     0x2ecc71,
-  Sword:      0x3498db,
-  Fruit:      0xe67e22,
-  Berries:    0x1abc9c,
-  Color:      0x00bcd4,
-  Event:      0x8e44ad,
+  SecretHint: 0x9b59b6, Boss: 0xe74c3c, Item: 0xf1c40f, Island: 0x2ecc71,
+  Sword: 0x3498db, Fruit: 0xe67e22, Berries: 0x1abc9c, Color: 0x00bcd4, Event: 0x8e44ad,
 };
 
 // ==================== HELPERS ====================
@@ -91,17 +79,15 @@ function send(res, code, obj) {
 
 // ==================== EMBED ====================
 function buildEmbed(p, routeKey) {
-  const isDel      = !!p.deleted;
-  const sea        = SEA[Number(p.placeId)] || 'Unknown';
-  const jobId      = String(p.jobId ?? '');
-  const jobEncoded = jobId ? Buffer.from(jobId).toString('base64url') : '—';
-  const ts         = Number(p.timestamp) || Math.floor(Date.now() / 1000);
+  const isDel = !!p.deleted;
+  const sea   = SEA[Number(p.placeId)] || 'Unknown';
+  const ts    = Number(p.timestamp) || Math.floor(Date.now() / 1000);
 
   const fields = [
     { name: '🌊 Sea',     value: sea,                       inline: true  },
     { name: '👥 Players', value: String(p.players ?? '?'),  inline: true  },
     { name: '🏷️ PlaceId', value: String(p.placeId ?? '?'),  inline: true  },
-    { name: '🔐 JobId',   value: '`' + jobEncoded + '`',    inline: false },
+    { name: '🔐 JobId',   value: '`' + String(p.jobId ?? '—') + '`', inline: false }, // Lấy trực tiếp từ p.jobId (đã encode)
   ];
 
   if (p.hint   != null) fields.push({ name: 'Hint',   value: String(p.hint),   inline: false });
@@ -142,13 +128,10 @@ async function postWebhook(url, body, retries = 3) {
   return 429;
 }
 
-// Hàm dọn dẹp bộ nhớ đệm (Chạy mỗi 5 phút để xóa các key cũ, tránh tràn RAM)
 setInterval(() => {
   const now = Date.now();
   for (const [key, timestamp] of DEDUP_CACHE.entries()) {
-    if (now - timestamp > SPAM_TIMEOUT) {
-      DEDUP_CACHE.delete(key);
-    }
+    if (now - timestamp > SPAM_TIMEOUT) DEDUP_CACHE.delete(key);
   }
 }, 5 * 60 * 1000);
 
@@ -157,7 +140,6 @@ const server = http.createServer(async (req, res) => {
   const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const url = parsedUrl.pathname;
 
-  // 🟢 XEM LOG KHI MỞ URL BẰNG TRÌNH DUYỆT (GET)
   if (req.method === 'GET' && (url === ROUTE || url === '/' || url === '/health')) {
     let result = IN_MEMORY_LOGS;
     const filterType  = parsedUrl.searchParams.get('type');
@@ -200,24 +182,28 @@ const server = http.createServer(async (req, res) => {
 
     if (!safeEqual(expected, authToken)) return send(res, 401, { ok: false, error: 'bad token' });
 
-    // ---------- 2. CHỐNG SPAM VÀ TRÙNG LẶP ----------
-    // Tạo Key độc nhất: Trùng JobId, trùng Type, trùng Tên, và trùng trạng thái (Sống/Chết)
+    // ---------- 2. ENCODE JOBID NGAY TẠI ĐÂY ----------
+    // Biến đổi jobId gốc thành dạng Base64URL trước khi lưu vào Web hoặc gửi Discord
+    if (p.jobId) {
+      p.jobId = Buffer.from(String(p.jobId)).toString('base64url');
+    }
+
+    // ---------- 3. CHỐNG SPAM VÀ TRÙNG LẶP ----------
     const dedupKey = `${p.jobId}|${p.type}|${p.name}|${p.deleted ? 1 : 0}`;
     const now = Date.now();
     const lastSeen = DEDUP_CACHE.get(dedupKey);
 
-    // Nếu key này vừa được gửi lên trong vòng 60 giây -> Bỏ qua luôn
     if (lastSeen && (now - lastSeen < SPAM_TIMEOUT)) {
       return send(res, 200, { ok: true, cached: true, msg: 'Duplicate ignored' });
     }
-    // Nếu hợp lệ, lưu thời gian hiện tại vào bộ đệm
     DEDUP_CACHE.set(dedupKey, now);
 
-    // ---------- 3. LƯU LOG NGUYÊN BẢN VÀO RAM ----------
+    // ---------- 4. LƯU LOG NGUYÊN BẢN VÀO RAM ----------
+    // Lúc này p.jobId đã là chuỗi encode, nên trên Web sẽ hiện encode
     IN_MEMORY_LOGS.unshift(p);
     if (IN_MEMORY_LOGS.length > 100) IN_MEMORY_LOGS.pop();
 
-    // ---------- 4. Route Discord ----------
+    // ---------- 5. Route Discord ----------
     const type  = String(p.type ?? '');
     const name  = String(p.name ?? '');
     const isDel = !!p.deleted;
@@ -238,7 +224,7 @@ const server = http.createServer(async (req, res) => {
     webhookUrl = webhookUrl || FALLBACK;
     if (!webhookUrl) return send(res, 500, { ok: false, error: `no webhook: ${routeKey}` });
 
-    // ---------- 5. Gửi Webhook ----------
+    // ---------- 6. Gửi Webhook ----------
     const dc = await postWebhook(webhookUrl, {
       username: 'VexzHub',
       embeds:   [buildEmbed(p, routeKey)],
