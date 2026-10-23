@@ -9,6 +9,12 @@ const PORT       = parseInt(process.env.PORT || '3000', 10);
 const HOST       = '0.0.0.0';
 const ROUTE      = process.env.ROUTE || '/api';
 const MAX_SKEW   = 300;
+const SPAM_TIMEOUT = 60 * 1000; // Chống spam: 60 giây (60,000 ms)
+
+// Mảng lưu log trên RAM (giới hạn 100 cái gần nhất)
+const IN_MEMORY_LOGS = [];
+// Bộ nhớ đệm chống trùng lặp (Key -> Timestamp)
+const DEDUP_CACHE = new Map();
 
 if (!SECRET_KEY) {
   console.error('[fatal] Missing env SECRET_KEY');
@@ -61,10 +67,7 @@ function canonicalField(v) {
 }
 
 function b64url(buf) {
-  return buf.toString('base64')
-            .replace(/\+/g, '-')
-            .replace(/\//g, '_')
-            .replace(/=+$/, '');
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function safeEqual(a, b) {
@@ -83,7 +86,7 @@ function readBody(req) {
 
 function send(res, code, obj) {
   res.writeHead(code, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(obj));
+  res.end(JSON.stringify(obj, null, 2));
 }
 
 // ==================== EMBED ====================
@@ -112,7 +115,7 @@ function buildEmbed(p, routeKey) {
     color:     isDel ? 0x7f8c8d : (COLORS[p.type] ?? 0x5865f2),
     fields,
     timestamp: new Date(ts * 1000).toISOString(),
-    footer:    { text: `${sea} · ${p.type}` },
+    footer:    { text: `VexzHub · ${sea} · ${p.type}` },
   };
 }
 
@@ -139,13 +142,31 @@ async function postWebhook(url, body, retries = 3) {
   return 429;
 }
 
+// Hàm dọn dẹp bộ nhớ đệm (Chạy mỗi 5 phút để xóa các key cũ, tránh tràn RAM)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamp] of DEDUP_CACHE.entries()) {
+    if (now - timestamp > SPAM_TIMEOUT) {
+      DEDUP_CACHE.delete(key);
+    }
+  }
+}, 5 * 60 * 1000);
+
 // ==================== SERVER ====================
 const server = http.createServer(async (req, res) => {
-  const url = req.url.split('?')[0];
+  const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+  const url = parsedUrl.pathname;
 
-  if (req.method === 'GET' && (url === '/' || url === '/health')) {
-    res.writeHead(200);
-    return res.end('ok');
+  // 🟢 XEM LOG KHI MỞ URL BẰNG TRÌNH DUYỆT (GET)
+  if (req.method === 'GET' && (url === ROUTE || url === '/' || url === '/health')) {
+    let result = IN_MEMORY_LOGS;
+    const filterType  = parsedUrl.searchParams.get('type');
+    const filterPlace = parsedUrl.searchParams.get('placeId');
+    
+    if (filterType) result = result.filter(x => String(x.type).toLowerCase() === filterType.toLowerCase());
+    if (filterPlace) result = result.filter(x => String(x.placeId) === String(filterPlace));
+
+    return send(res, 200, result);
   }
 
   if (req.method !== 'POST' || url !== ROUTE) {
@@ -163,14 +184,9 @@ const server = http.createServer(async (req, res) => {
     const authTime  = String(req.headers['x-auth-time']  || '');
     const authToken = String(req.headers['x-auth-token'] || '');
 
-    if (!/^\d+$/.test(authTime))
-      return send(res, 401, { ok: false, error: 'no time' });
-
-    if (Math.abs(Math.floor(Date.now() / 1000) - parseInt(authTime, 10)) > MAX_SKEW)
-      return send(res, 401, { ok: false, error: 'time skew' });
-
-    if (!authToken)
-      return send(res, 401, { ok: false, error: 'no token' });
+    if (!/^\d+$/.test(authTime)) return send(res, 401, { ok: false, error: 'no time' });
+    if (Math.abs(Math.floor(Date.now() / 1000) - parseInt(authTime, 10)) > MAX_SKEW) return send(res, 401, { ok: false, error: 'time skew' });
+    if (!authToken) return send(res, 401, { ok: false, error: 'no token' });
 
     const canonical =
       canonicalField(authTime) +
@@ -180,20 +196,33 @@ const server = http.createServer(async (req, res) => {
       canonicalField(p.name    ?? '') +
       canonicalField(p.deleted ? 1 : 0);
 
-    const expected = b64url(
-      crypto.createHmac('sha256', SECRET_KEY).update(canonical, 'utf8').digest()
-    );
+    const expected = b64url(crypto.createHmac('sha256', SECRET_KEY).update(canonical, 'utf8').digest());
 
-    if (!safeEqual(expected, authToken))
-      return send(res, 401, { ok: false, error: 'bad token' });
+    if (!safeEqual(expected, authToken)) return send(res, 401, { ok: false, error: 'bad token' });
 
-    // ---------- 2. Route ----------
+    // ---------- 2. CHỐNG SPAM VÀ TRÙNG LẶP ----------
+    // Tạo Key độc nhất: Trùng JobId, trùng Type, trùng Tên, và trùng trạng thái (Sống/Chết)
+    const dedupKey = `${p.jobId}|${p.type}|${p.name}|${p.deleted ? 1 : 0}`;
+    const now = Date.now();
+    const lastSeen = DEDUP_CACHE.get(dedupKey);
+
+    // Nếu key này vừa được gửi lên trong vòng 60 giây -> Bỏ qua luôn
+    if (lastSeen && (now - lastSeen < SPAM_TIMEOUT)) {
+      return send(res, 200, { ok: true, cached: true, msg: 'Duplicate ignored' });
+    }
+    // Nếu hợp lệ, lưu thời gian hiện tại vào bộ đệm
+    DEDUP_CACHE.set(dedupKey, now);
+
+    // ---------- 3. LƯU LOG NGUYÊN BẢN VÀO RAM ----------
+    IN_MEMORY_LOGS.unshift(p);
+    if (IN_MEMORY_LOGS.length > 100) IN_MEMORY_LOGS.pop();
+
+    // ---------- 4. Route Discord ----------
     const type  = String(p.type ?? '');
     const name  = String(p.name ?? '');
     const isDel = !!p.deleted;
 
     let routeKey, webhookUrl;
-
     if (isDel) {
       routeKey   = 'Deleted';
       webhookUrl = WEBHOOKS.Deleted;
@@ -207,13 +236,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     webhookUrl = webhookUrl || FALLBACK;
+    if (!webhookUrl) return send(res, 500, { ok: false, error: `no webhook: ${routeKey}` });
 
-    if (!webhookUrl)
-      return send(res, 500, { ok: false, error: `no webhook: ${routeKey}` });
-
-    // ---------- 3. Send ----------
+    // ---------- 5. Gửi Webhook ----------
     const dc = await postWebhook(webhookUrl, {
-      username: 'Blox Reporter',
+      username: 'VexzHub',
       embeds:   [buildEmbed(p, routeKey)],
     });
 
@@ -227,8 +254,7 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`[blox-reporter] listening on ${HOST}:${PORT}${ROUTE}`);
-
+  console.log(`[VexzHub] listening on ${HOST}:${PORT}${ROUTE}`);
   for (const [route, url] of Object.entries(WEBHOOKS)) {
     if (!url) console.warn(`[warn] missing webhook for '${route}'`);
   }
